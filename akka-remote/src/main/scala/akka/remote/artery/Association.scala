@@ -59,7 +59,7 @@ private[akka] class Association(
   private val restartCounter = new RestartCounter(maxRestarts, restartTimeout)
   private val largeMessageChannelEnabled = largeMessageDestinations.children.nonEmpty
 
-  @volatile private[this] var queue: SourceQueueWithComplete[Send] = _
+  @volatile private[this] var queue: SendQueue.OfferApi[Send] = _
   @volatile private[this] var largeQueue: SourceQueueWithComplete[Send] = _
   @volatile private[this] var controlQueue: SourceQueueWithComplete[Send] = _
   @volatile private[this] var _outboundControlIngress: OutboundControlIngress = _
@@ -247,7 +247,9 @@ private[akka] class Association(
   }
 
   private def runOutboundOrdinaryMessagesStream(): Unit = {
-    val (q, completed) = Source.queue(256, OverflowStrategy.dropBuffer)
+    // FIXME config queue size, and it should also be possible to use some kind of LinkedQueue
+    //       for less memory consumption
+    val (q, completed) = Source.fromGraph(new SendQueue[Send](capacity = 3072))
       .toMat(transport.outbound(this))(Keep.both)
       .run()(materializer)
     queue = q
