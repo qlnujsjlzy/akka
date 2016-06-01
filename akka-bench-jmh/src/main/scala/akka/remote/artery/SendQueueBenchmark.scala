@@ -51,59 +51,59 @@ class SendQueueBenchmark {
     Await.result(system.terminate(), 5.seconds)
   }
 
-  //  @Benchmark
-  //  @OperationsPerInvocation(100000)
-  //  def queue(): Unit = {
-  //    val latch = new CountDownLatch(1)
-  //    val barrier = new CyclicBarrier(2)
-  //    val N = 100000
-  //    val burstSize = 1000
-  //
-  //    val source = Source.queue[Int](1024, OverflowStrategy.dropBuffer)
-  //
-  //    val (queue, killSwitch) = source.viaMat(KillSwitches.single)(Keep.both)
-  //      .toMat(new BarrierSink(N, latch, burstSize, barrier))(Keep.left).run()(materializer)
-  //
-  //    var n = 1
-  //    while (n <= N) {
-  //      queue.offer(n)
-  //      if (n % burstSize == 0 && n < N) {
-  //        barrier.await()
-  //      }
-  //      n += 1
-  //    }
-  //
-  //    if (!latch.await(30, TimeUnit.SECONDS))
-  //      throw new RuntimeException("Latch didn't complete in time")
-  //    killSwitch.shutdown()
-  //  }
-  //
-  //  @Benchmark
-  //  @OperationsPerInvocation(100000)
-  //  def actorRef(): Unit = {
-  //    val latch = new CountDownLatch(1)
-  //    val barrier = new CyclicBarrier(2)
-  //    val N = 100000
-  //    val burstSize = 1000
-  //
-  //    val source = Source.actorRef(1024, OverflowStrategy.dropBuffer)
-  //
-  //    val (ref, killSwitch) = source.viaMat(KillSwitches.single)(Keep.both)
-  //      .toMat(new BarrierSink(N, latch, burstSize, barrier))(Keep.left).run()(materializer)
-  //
-  //    var n = 1
-  //    while (n <= N) {
-  //      ref ! n
-  //      if (n % burstSize == 0 && n < N) {
-  //        barrier.await()
-  //      }
-  //      n += 1
-  //    }
-  //
-  //    if (!latch.await(30, TimeUnit.SECONDS))
-  //      throw new RuntimeException("Latch didn't complete in time")
-  //    killSwitch.shutdown()
-  //  }
+  @Benchmark
+  @OperationsPerInvocation(100000)
+  def queue(): Unit = {
+    val latch = new CountDownLatch(1)
+    val barrier = new CyclicBarrier(2)
+    val N = 100000
+    val burstSize = 1000
+
+    val source = Source.queue[Int](1024, OverflowStrategy.dropBuffer)
+
+    val (queue, killSwitch) = source.viaMat(KillSwitches.single)(Keep.both)
+      .toMat(new BarrierSink(N, latch, burstSize, barrier))(Keep.left).run()(materializer)
+
+    var n = 1
+    while (n <= N) {
+      queue.offer(n)
+      if (n % burstSize == 0 && n < N) {
+        barrier.await()
+      }
+      n += 1
+    }
+
+    if (!latch.await(30, TimeUnit.SECONDS))
+      throw new RuntimeException("Latch didn't complete in time")
+    killSwitch.shutdown()
+  }
+
+  @Benchmark
+  @OperationsPerInvocation(100000)
+  def actorRef(): Unit = {
+    val latch = new CountDownLatch(1)
+    val barrier = new CyclicBarrier(2)
+    val N = 100000
+    val burstSize = 1000
+
+    val source = Source.actorRef(1024, OverflowStrategy.dropBuffer)
+
+    val (ref, killSwitch) = source.viaMat(KillSwitches.single)(Keep.both)
+      .toMat(new BarrierSink(N, latch, burstSize, barrier))(Keep.left).run()(materializer)
+
+    var n = 1
+    while (n <= N) {
+      ref ! n
+      if (n % burstSize == 0 && n < N) {
+        barrier.await()
+      }
+      n += 1
+    }
+
+    if (!latch.await(30, TimeUnit.SECONDS))
+      throw new RuntimeException("Latch didn't complete in time")
+    killSwitch.shutdown()
+  }
 
   @Benchmark
   @OperationsPerInvocation(100000)
