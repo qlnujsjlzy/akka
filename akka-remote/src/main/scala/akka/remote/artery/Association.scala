@@ -7,14 +7,12 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.function.{ Function ⇒ JFunction }
-
 import scala.annotation.tailrec
 import scala.concurrent.Future
 import scala.concurrent.Promise
 import scala.concurrent.duration._
 import scala.concurrent.duration.FiniteDuration
 import scala.util.Success
-
 import akka.{ Done, NotUsed }
 import akka.actor.ActorRef
 import akka.actor.ActorSelectionMessage
@@ -36,6 +34,7 @@ import akka.stream.scaladsl.Keep
 import akka.stream.scaladsl.Source
 import akka.stream.scaladsl.SourceQueueWithComplete
 import akka.util.{ Unsafe, WildcardTree }
+import org.agrona.concurrent.ManyToOneConcurrentArrayQueue
 
 /**
  * INTERNAL API
@@ -59,7 +58,7 @@ private[akka] class Association(
   private val restartCounter = new RestartCounter(maxRestarts, restartTimeout)
   private val largeMessageChannelEnabled = largeMessageDestinations.children.nonEmpty
 
-  @volatile private[this] var queue: SendQueue.OfferApi[Send] = _
+  @volatile private[this] var queue: SendQueue.QueueValue[Send] = _
   @volatile private[this] var largeQueue: SourceQueueWithComplete[Send] = _
   @volatile private[this] var controlQueue: SourceQueueWithComplete[Send] = _
   @volatile private[this] var _outboundControlIngress: OutboundControlIngress = _
@@ -249,10 +248,13 @@ private[akka] class Association(
   private def runOutboundOrdinaryMessagesStream(): Unit = {
     // FIXME config queue size, and it should also be possible to use some kind of LinkedQueue
     //       for less memory consumption
-    val (q, completed) = Source.fromGraph(new SendQueue[Send](capacity = 3072))
+    val q = new ManyToOneConcurrentArrayQueue[Send](3072)
+    val (queueValue, completed) = Source.fromGraph(new SendQueue[Send])
       .toMat(transport.outbound(this))(Keep.both)
       .run()(materializer)
-    queue = q
+    queueValue.inject(q)
+    // FIXME we should be able to use the actual queue before materialization, before injecting it into the stage
+    queue = queueValue
     attachStreamRestart("Outbound message stream", completed, _ ⇒ runOutboundOrdinaryMessagesStream())
   }
 

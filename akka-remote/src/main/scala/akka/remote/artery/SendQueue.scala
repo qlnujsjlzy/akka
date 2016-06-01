@@ -3,6 +3,7 @@
  */
 package akka.remote.artery
 
+import java.util.Queue
 import akka.stream.stage.GraphStage
 import akka.stream.stage.OutHandler
 import akka.stream.Attributes
@@ -14,12 +15,14 @@ import akka.stream.stage.GraphStageWithMaterializedValue
 import org.agrona.concurrent.ManyToOneConcurrentLinkedQueueTail
 import org.agrona.concurrent.ManyToOneConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicInteger
+import scala.annotation.tailrec
 
 /**
  * INTERNAL API
  */
 private[remote] object SendQueue {
-  trait OfferApi[T] {
+  trait QueueValue[T] {
+    def inject(queue: Queue[T]): Unit
     def offer(message: T): Boolean
   }
 
@@ -31,15 +34,15 @@ private[remote] object SendQueue {
 /**
  * INTERNAL API
  */
-private[remote] final class SendQueue[T](capacity: Int) extends GraphStageWithMaterializedValue[SourceShape[T], SendQueue.OfferApi[T]] {
+private[remote] final class SendQueue[T] extends GraphStageWithMaterializedValue[SourceShape[T], SendQueue.QueueValue[T]] {
   import SendQueue._
 
   val out: Outlet[T] = Outlet("SendQueue.out")
   override val shape: SourceShape[T] = SourceShape(out)
 
-  override def createLogicAndMaterializedValue(inheritedAttributes: Attributes): (GraphStageLogic, OfferApi[T]) = {
+  override def createLogicAndMaterializedValue(inheritedAttributes: Attributes): (GraphStageLogic, QueueValue[T]) = {
     @volatile var needWakeup = false
-    val queue = new ManyToOneConcurrentArrayQueue[T](capacity)
+    @volatile var queue: Queue[T] = null
     // TODO perhaps try similar with ManyToOneConcurrentLinkedQueue or AbstractNodeQueue
 
     val logic = new GraphStageLogic(shape) with OutHandler with WakeupSignal {
@@ -48,15 +51,23 @@ private[remote] final class SendQueue[T](capacity: Int) extends GraphStageWithMa
           tryPush()
       }
 
-      override def onPull(): Unit =
-        tryPush()
-
-      private def tryPush(): Unit = {
+      override def preStart(): Unit = {
         needWakeup = true
+      }
+
+      override def onPull(): Unit = {
+        if (queue ne null)
+          tryPush()
+      }
+
+      @tailrec private def tryPush(firstAttempt: Boolean = true): Unit = {
         queue.poll() match {
           case null ⇒
-          // empty queue, needWakeup is true
-          // note that it is not enough to set needWakeup here
+            needWakeup = true
+            // additional poll() to grab any elements that might missed the needWakeup
+            // and have been enqueued just after it
+            if (firstAttempt)
+              tryPush(firstAttempt = false)
           case elem ⇒
             needWakeup = false // there will be another onPull
             push(out, elem)
@@ -64,27 +75,38 @@ private[remote] final class SendQueue[T](capacity: Int) extends GraphStageWithMa
       }
 
       // external call
-      override def wakeup(): Unit =
+      override def wakeup(): Unit = {
         wakeupCallback.invoke(())
+      }
 
       override def postStop(): Unit = {
-        queue.clear()
+        if (queue ne null)
+          queue.clear()
         super.postStop()
       }
 
       setHandler(out, this)
     }
 
-    val offerApi = new OfferApi[T] {
+    val queueValue = new QueueValue[T] {
+      override def inject(q: Queue[T]): Unit = {
+        if (queue ne null) throw new IllegalStateException("queue already injected")
+        queue = q
+        if (needWakeup)
+          logic.wakeup()
+      }
+
       override def offer(message: T): Boolean = {
-        val result = queue.offer(message)
+        val q = queue
+        if (q eq null) throw new IllegalStateException("offer not allowed before injecting the queue")
+        val result = q.offer(message)
         if (result && needWakeup)
           logic.wakeup()
         result
       }
     }
 
-    (logic, offerApi)
+    (logic, queueValue)
 
   }
 }
