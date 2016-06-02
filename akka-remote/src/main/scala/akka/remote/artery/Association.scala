@@ -4,6 +4,7 @@
 package akka.remote.artery
 
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.function.{ Function ⇒ JFunction }
@@ -52,7 +53,7 @@ private[akka] class Association(
   extends AbstractAssociation with OutboundContext {
 
   private val log = Logging(transport.system, getClass.getName)
-  private val controlQueueSize = transport.provider.remoteSettings.SysMsgBufferSize
+  private val controlQueueSize = transport.remoteSettings.SysMsgBufferSize
 
   private val restartTimeout: FiniteDuration = 5.seconds // FIXME config
   private val maxRestarts = 5 // FIXME config
@@ -64,6 +65,13 @@ private[akka] class Association(
   @volatile private[this] var controlQueue: SourceQueueWithComplete[Send] = _
   @volatile private[this] var _outboundControlIngress: OutboundControlIngress = _
   @volatile private[this] var materializing = new CountDownLatch(1)
+
+  private val _testStages: CopyOnWriteArrayList[TestManagementApi] = new CopyOnWriteArrayList
+
+  def testStages(): List[TestManagementApi] = {
+    import scala.collection.JavaConverters._
+    _testStages.asScala.toList
+  }
 
   def outboundControlIngress: OutboundControlIngress = {
     if (_outboundControlIngress ne null)
@@ -231,9 +239,22 @@ private[akka] class Association(
     // stage in the control stream may access the outboundControlIngress before returned here
     // using CountDownLatch to make sure that materialization is completed before accessing outboundControlIngress
     materializing = new CountDownLatch(1)
-    val (q, (control, completed)) = Source.queue(controlQueueSize, OverflowStrategy.backpressure)
-      .toMat(transport.outboundControl(this))(Keep.both)
-      .run()(materializer)
+
+    val (q, (control, completed)) =
+      if (transport.remoteSettings.TestMode) {
+        val ((q, mgmt), (control, completed)) =
+          Source.queue(controlQueueSize, OverflowStrategy.backpressure)
+            .viaMat(transport.outboundTestFlow(this))(Keep.both)
+            .toMat(transport.outboundControl(this))(Keep.both)
+            .run()(materializer)
+        _testStages.add(mgmt)
+        (q, (control, completed))
+      } else {
+        Source.queue(controlQueueSize, OverflowStrategy.backpressure)
+          .toMat(transport.outboundControl(this))(Keep.both)
+          .run()(materializer)
+      }
+
     controlQueue = q
     _outboundControlIngress = control
     materializing.countDown()
@@ -247,17 +268,40 @@ private[akka] class Association(
   }
 
   private def runOutboundOrdinaryMessagesStream(): Unit = {
-    val (q, completed) = Source.queue(256, OverflowStrategy.dropBuffer)
-      .toMat(transport.outbound(this))(Keep.both)
-      .run()(materializer)
+    val (q, completed) =
+      if (transport.remoteSettings.TestMode) {
+        val ((q, mgmt), completed) = Source.queue(256, OverflowStrategy.dropBuffer)
+          .viaMat(transport.outboundTestFlow(this))(Keep.both)
+          .toMat(transport.outbound(this))(Keep.both)
+          .run()(materializer)
+        _testStages.add(mgmt)
+        (q, completed)
+      } else {
+        Source.queue(256, OverflowStrategy.dropBuffer)
+          .toMat(transport.outbound(this))(Keep.both)
+          .run()(materializer)
+      }
+
     queue = q
+
     attachStreamRestart("Outbound message stream", completed, _ ⇒ runOutboundOrdinaryMessagesStream())
   }
 
   private def runOutboundLargeMessagesStream(): Unit = {
-    val (q, completed) = Source.queue(256, OverflowStrategy.dropBuffer)
-      .toMat(transport.outboundLarge(this))(Keep.both)
-      .run()(materializer)
+    val (q, completed) =
+      if (transport.remoteSettings.TestMode) {
+        val ((q, mgmt), completed) = Source.queue(256, OverflowStrategy.dropBuffer)
+          .viaMat(transport.outboundTestFlow(this))(Keep.both)
+          .toMat(transport.outboundLarge(this))(Keep.both)
+          .run()(materializer)
+        _testStages.add(mgmt)
+        (q, completed)
+      } else {
+        Source.queue(256, OverflowStrategy.dropBuffer)
+          .toMat(transport.outboundLarge(this))(Keep.both)
+          .run()(materializer)
+      }
+
     largeQueue = q
     attachStreamRestart("Outbound large message stream", completed, _ ⇒ runOutboundLargeMessagesStream())
   }
@@ -319,5 +363,10 @@ private[remote] class AssociationRegistry(createAssociation: Address ⇒ Associa
     if ((previous ne null) && (previous ne a))
       throw new IllegalArgumentException(s"UID collision old [$previous] new [$a]")
     a
+  }
+
+  def allAssociations: Set[Association] = {
+    import scala.collection.JavaConverters._
+    associationsByAddress.values.asScala.toSet
   }
 }

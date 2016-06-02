@@ -4,31 +4,36 @@
 package akka.remote.artery
 
 import java.io.File
-import java.nio.ByteOrder
+import java.net.InetSocketAddress
+import java.nio.channels.DatagramChannel
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicLong
+
+import scala.collection.JavaConverters._
 import scala.concurrent.Future
 import scala.concurrent.Promise
 import scala.concurrent.duration._
 import scala.util.Failure
 import scala.util.Success
 import scala.util.Try
+
 import akka.Done
 import akka.NotUsed
 import akka.actor.ActorRef
 import akka.actor.Address
+import akka.actor.Cancellable
 import akka.actor.ExtendedActorSystem
 import akka.actor.InternalActorRef
-import akka.actor.Props
 import akka.event.Logging
 import akka.event.LoggingAdapter
 import akka.remote.AddressUidExtension
 import akka.remote.EndpointManager.Send
 import akka.remote.EventPublisher
-import akka.remote.MessageSerializer
 import akka.remote.RemoteActorRef
 import akka.remote.RemoteActorRefProvider
+import akka.remote.RemoteSettings
 import akka.remote.RemoteTransport
 import akka.remote.RemotingLifecycleEvent
-import akka.remote.SeqNo
 import akka.remote.ThisActorSystemQuarantinedEvent
 import akka.remote.UniqueAddress
 import akka.remote.artery.InboundControlJunction.ControlMessageObserver
@@ -36,37 +41,28 @@ import akka.remote.artery.InboundControlJunction.ControlMessageSubject
 import akka.remote.artery.OutboundControlJunction.OutboundControlIngress
 import akka.remote.transport.AkkaPduCodec
 import akka.remote.transport.AkkaPduProtobufCodec
-import akka.serialization.Serialization
 import akka.stream.AbruptTerminationException
 import akka.stream.ActorMaterializer
+import akka.stream.ActorMaterializerSettings
 import akka.stream.KillSwitches
 import akka.stream.Materializer
 import akka.stream.SharedKillSwitch
 import akka.stream.scaladsl.Flow
-import akka.stream.scaladsl.Framing
 import akka.stream.scaladsl.Keep
 import akka.stream.scaladsl.Sink
 import akka.stream.scaladsl.Source
-import akka.util.{ ByteString, ByteStringBuilder, WildcardTree }
 import akka.util.Helpers.ConfigOps
 import akka.util.Helpers.Requiring
+import akka.util.WildcardTree
 import io.aeron.Aeron
 import io.aeron.AvailableImageHandler
+import io.aeron.CncFileDescriptor
 import io.aeron.Image
 import io.aeron.UnavailableImageHandler
 import io.aeron.driver.MediaDriver
 import io.aeron.exceptions.ConductorServiceTimeoutException
 import org.agrona.ErrorHandler
 import org.agrona.IoUtil
-import java.io.File
-import java.net.InetSocketAddress
-import java.nio.channels.DatagramChannel
-import akka.remote.artery.OutboundControlJunction.OutboundControlIngress
-import io.aeron.CncFileDescriptor
-import java.util.concurrent.atomic.AtomicLong
-import akka.actor.Cancellable
-import scala.collection.JavaConverters._
-import akka.stream.ActorMaterializerSettings
 /**
  * INTERNAL API
  */
@@ -212,7 +208,6 @@ private[akka] trait OutboundContext {
  */
 private[remote] class ArteryTransport(_system: ExtendedActorSystem, _provider: RemoteActorRefProvider)
   extends RemoteTransport(_system, _provider) with InboundContext {
-  import provider.remoteSettings
 
   // these vars are initialized once in the start method
   @volatile private[this] var _localAddress: UniqueAddress = _
@@ -233,6 +228,8 @@ private[remote] class ArteryTransport(_system: ExtendedActorSystem, _provider: R
   private val codec: AkkaPduCodec = AkkaPduProtobufCodec
   private val killSwitch: SharedKillSwitch = KillSwitches.shared("transportKillSwitch")
   @volatile private[this] var _shutdown = false
+
+  private val testStages: CopyOnWriteArrayList[TestManagementApi] = new CopyOnWriteArrayList
 
   // FIXME config
   private val systemMessageResendInterval: FiniteDuration = 1.second
@@ -270,6 +267,8 @@ private[remote] class ArteryTransport(_system: ExtendedActorSystem, _provider: R
 
   private val associationRegistry = new AssociationRegistry(
     remoteAddress ⇒ new Association(this, materializer, remoteAddress, controlSubject, largeMessageDestinations))
+
+  def remoteSettings: RemoteSettings = provider.remoteSettings
 
   override def start(): Unit = {
     startMediaDriver()
@@ -373,11 +372,24 @@ private[remote] class ArteryTransport(_system: ExtendedActorSystem, _provider: R
   }
 
   private def runInboundControlStream(): Unit = {
-    val (c, completed) = Source.fromGraph(new AeronSource(inboundChannel, controlStreamId, aeron, taskRunner, envelopePool))
-      .viaMat(inboundControlFlow)(Keep.right)
-      .toMat(Sink.ignore)(Keep.both)
-      .run()(materializer)
-    controlSubject = c
+    val (ctrl, completed) =
+      if (remoteSettings.TestMode) {
+        val (mgmt, (ctrl, completed)) =
+          aeronSource(controlStreamId, envelopePool)
+            .via(inboundFlow)
+            .viaMat(inboundTestFlow)(Keep.right)
+            .toMat(inboundControlSink)(Keep.both)
+            .run()(materializer)
+        testStages.add(mgmt)
+        (ctrl, completed)
+      } else {
+        aeronSource(controlStreamId, envelopePool)
+          .via(inboundFlow)
+          .toMat(inboundControlSink)(Keep.right)
+          .run()(materializer)
+      }
+
+    controlSubject = ctrl
 
     controlSubject.attach(new ControlMessageObserver {
       override def notify(inboundEnvelope: InboundEnvelope): Unit = {
@@ -410,17 +422,46 @@ private[remote] class ArteryTransport(_system: ExtendedActorSystem, _provider: R
   }
 
   private def runInboundOrdinaryMessagesStream(): Unit = {
-    val completed = Source.fromGraph(new AeronSource(inboundChannel, ordinaryStreamId, aeron, taskRunner, envelopePool))
-      .via(inboundFlow)
-      .runWith(Sink.ignore)(materializer)
+    val completed =
+      if (remoteSettings.TestMode) {
+        val (mgmt, c) = aeronSource(ordinaryStreamId, envelopePool)
+          .via(inboundFlow)
+          .viaMat(inboundTestFlow)(Keep.right)
+          .toMat(inboundSink)(Keep.both)
+          .run()(materializer)
+        testStages.add(mgmt)
+        c
+      } else {
+        aeronSource(ordinaryStreamId, envelopePool)
+          .via(inboundFlow)
+          .toMat(inboundSink)(Keep.right)
+          .run()(materializer)
+      }
 
     attachStreamRestart("Inbound message stream", completed, () ⇒ runInboundOrdinaryMessagesStream())
   }
 
   private def runInboundLargeMessagesStream(): Unit = {
-    val completed = Source.fromGraph(new AeronSource(inboundChannel, largeStreamId, aeron, taskRunner, largeEnvelopePool))
+    val completed =
+      if (remoteSettings.TestMode) {
+        val (mgmt, c) = aeronSource(largeStreamId, largeEnvelopePool)
+          .via(inboundLargeFlow)
+          .viaMat(inboundTestFlow)(Keep.right)
+          .toMat(inboundSink)(Keep.both)
+          .run()(materializer)
+        testStages.add(mgmt)
+        c
+      } else {
+        aeronSource(largeStreamId, largeEnvelopePool)
+          .via(inboundLargeFlow)
+          .toMat(inboundSink)(Keep.right)
+          .run()(materializer)
+      }
+
+    aeronSource(largeStreamId, largeEnvelopePool)
       .via(inboundLargeFlow)
-      .runWith(Sink.ignore)(materializer)
+      .toMat(inboundSink)(Keep.right)
+      .run()(materializer)
 
     attachStreamRestart("Inbound large message stream", completed, () ⇒ runInboundLargeMessagesStream())
   }
@@ -458,6 +499,17 @@ private[remote] class ArteryTransport(_system: ExtendedActorSystem, _provider: R
   }
 
   private[remote] def isShutdown(): Boolean = _shutdown
+
+  override def managementCommand(cmd: Any): Future[Boolean] = {
+    if (testStages.isEmpty)
+      Future.successful(false)
+    else {
+      import scala.collection.JavaConverters._
+      import system.dispatcher
+      val allTestStages = testStages.asScala.toVector ++ associationRegistry.allAssociations.flatMap(_.testStages)
+      Future.sequence(allTestStages.map(_.send(cmd))).map(_ ⇒ true)
+    }
+  }
 
   // InboundContext
   override def sendControl(to: Address, message: ControlMessage) =
@@ -526,6 +578,9 @@ private[remote] class ArteryTransport(_system: ExtendedActorSystem, _provider: R
 
   def encoder: Flow[Send, EnvelopeBuffer, NotUsed] = createEncoder(envelopePool)
 
+  def aeronSource(streamId: Int, pool: EnvelopeBufferPool): Source[EnvelopeBuffer, NotUsed] =
+    Source.fromGraph(new AeronSource(inboundChannel, streamId, aeron, taskRunner, pool))
+
   val messageDispatcherSink: Sink[InboundEnvelope, Future[Done]] = Sink.foreach[InboundEnvelope] { m ⇒
     messageDispatcher.dispatch(m.recipient, m.recipientAddress, m.message, m.senderOption)
   }
@@ -538,34 +593,38 @@ private[remote] class ArteryTransport(_system: ExtendedActorSystem, _provider: R
 
   def decoder: Flow[EnvelopeBuffer, InboundEnvelope, NotUsed] = createDecoder(envelopePool)
 
-  def inboundSink: Sink[InboundEnvelope, NotUsed] =
+  def inboundSink: Sink[InboundEnvelope, Future[Done]] =
     Flow[InboundEnvelope]
       .via(new InboundHandshake(this, inControlStream = false))
       .via(new InboundQuarantineCheck(this))
-      .to(messageDispatcherSink)
+      .toMat(messageDispatcherSink)(Keep.right)
 
-  def inboundFlow: Flow[EnvelopeBuffer, ByteString, NotUsed] = {
-    Flow.fromSinkAndSource(
-      decoder.to(inboundSink),
-      Source.maybe[ByteString].via(killSwitch.flow))
+  def inboundFlow: Flow[EnvelopeBuffer, InboundEnvelope, NotUsed] = {
+    Flow[EnvelopeBuffer]
+      .via(killSwitch.flow)
+      .via(decoder)
   }
 
-  def inboundLargeFlow: Flow[EnvelopeBuffer, ByteString, NotUsed] = {
-    Flow.fromSinkAndSource(
-      createDecoder(largeEnvelopePool).to(inboundSink),
-      Source.maybe[ByteString].via(killSwitch.flow))
+  def inboundLargeFlow: Flow[EnvelopeBuffer, InboundEnvelope, NotUsed] = {
+    Flow[EnvelopeBuffer]
+      .via(killSwitch.flow)
+      .via(createDecoder(largeEnvelopePool))
   }
 
-  def inboundControlFlow: Flow[EnvelopeBuffer, ByteString, ControlMessageSubject] = {
-    Flow.fromSinkAndSourceMat(
-      decoder
-        .via(new InboundHandshake(this, inControlStream = true))
-        .via(new InboundQuarantineCheck(this))
-        .viaMat(new InboundControlJunction)(Keep.right)
-        .via(new SystemMessageAcker(this))
-        .to(messageDispatcherSink),
-      Source.maybe[ByteString].via(killSwitch.flow))((a, b) ⇒ a)
+  def inboundControlSink: Sink[InboundEnvelope, (ControlMessageSubject, Future[Done])] = {
+    Flow[InboundEnvelope]
+      .via(new InboundHandshake(this, inControlStream = true))
+      .via(new InboundQuarantineCheck(this))
+      .viaMat(new InboundControlJunction)(Keep.right)
+      .via(new SystemMessageAcker(this))
+      .toMat(messageDispatcherSink)(Keep.both)
   }
+
+  def inboundTestFlow: Flow[InboundEnvelope, InboundEnvelope, TestManagementApi] =
+    Flow.fromGraph(new InboundTestStage(this))
+
+  def outboundTestFlow(association: Association): Flow[Send, Send, TestManagementApi] =
+    Flow.fromGraph(new OutboundTestStage(association))
 
 }
 
