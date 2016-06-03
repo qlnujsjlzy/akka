@@ -16,6 +16,7 @@ import org.agrona.concurrent.ManyToOneConcurrentLinkedQueueTail
 import org.agrona.concurrent.ManyToOneConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicInteger
 import scala.annotation.tailrec
+import scala.concurrent.Promise
 
 /**
  * INTERNAL API
@@ -42,26 +43,37 @@ private[remote] final class SendQueue[T] extends GraphStageWithMaterializedValue
 
   override def createLogicAndMaterializedValue(inheritedAttributes: Attributes): (GraphStageLogic, QueueValue[T]) = {
     @volatile var needWakeup = false
-    @volatile var queue: Queue[T] = null
+    @volatile var producerQueue: Queue[T] = null
+    val queuePromise = Promise[Queue[T]]()
     // TODO perhaps try similar with ManyToOneConcurrentLinkedQueue or AbstractNodeQueue
 
     val logic = new GraphStageLogic(shape) with OutHandler with WakeupSignal {
+
+      // using a local field for the consumer side of queue to avoid volatile access
+      private var consumerQueue: Queue[T] = null
+
       private val wakeupCallback = getAsyncCallback[Unit] { _ ⇒
         if (isAvailable(out))
           tryPush()
       }
 
       override def preStart(): Unit = {
-        needWakeup = true
+        implicit val ec = materializer.executionContext
+        queuePromise.future.foreach(getAsyncCallback[Queue[T]] { q ⇒
+          consumerQueue = q
+          needWakeup = true
+          if (isAvailable(out))
+            tryPush()
+        }.invoke)
       }
 
       override def onPull(): Unit = {
-        if (queue ne null)
+        if (consumerQueue ne null)
           tryPush()
       }
 
       @tailrec private def tryPush(firstAttempt: Boolean = true): Unit = {
-        queue.poll() match {
+        consumerQueue.poll() match {
           case null ⇒
             needWakeup = true
             // additional poll() to grab any elements that might missed the needWakeup
@@ -80,8 +92,8 @@ private[remote] final class SendQueue[T] extends GraphStageWithMaterializedValue
       }
 
       override def postStop(): Unit = {
-        if (queue ne null)
-          queue.clear()
+        if (consumerQueue ne null)
+          consumerQueue.clear()
         super.postStop()
       }
 
@@ -90,14 +102,12 @@ private[remote] final class SendQueue[T] extends GraphStageWithMaterializedValue
 
     val queueValue = new QueueValue[T] {
       override def inject(q: Queue[T]): Unit = {
-        if (queue ne null) throw new IllegalStateException("queue already injected")
-        queue = q
-        if (needWakeup)
-          logic.wakeup()
+        producerQueue = q
+        queuePromise.success(q)
       }
 
       override def offer(message: T): Boolean = {
-        val q = queue
+        val q = producerQueue
         if (q eq null) throw new IllegalStateException("offer not allowed before injecting the queue")
         val result = q.offer(message)
         if (result && needWakeup)
