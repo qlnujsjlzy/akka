@@ -22,9 +22,12 @@ import scala.concurrent.Promise
  * INTERNAL API
  */
 private[remote] object SendQueue {
-  trait QueueValue[T] {
-    def inject(queue: Queue[T]): Unit
+  trait ProducerApi[T] {
     def offer(message: T): Boolean
+  }
+
+  trait QueueValue[T] extends ProducerApi[T] {
+    def inject(queue: Queue[T]): Unit
   }
 
   private trait WakeupSignal {
@@ -45,7 +48,6 @@ private[remote] final class SendQueue[T] extends GraphStageWithMaterializedValue
     @volatile var needWakeup = false
     @volatile var producerQueue: Queue[T] = null
     val queuePromise = Promise[Queue[T]]()
-    // TODO perhaps try similar with ManyToOneConcurrentLinkedQueue or AbstractNodeQueue
 
     val logic = new GraphStageLogic(shape) with OutHandler with WakeupSignal {
 
