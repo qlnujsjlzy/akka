@@ -198,12 +198,14 @@ private[akka] class InboundHandshake(inboundContext: InboundContext, inControlSt
           push(out, env)
         else {
           // FIXME remove, only debug
-          log.warning(s"Dropping message [{}] from unknown system with UID [{}]. " +
+          log.warning(
+            s"Dropping message [{}] from unknown system with UID [{}]. " +
             "This system with UID [{}] was probably restarted. " +
             "Messages will be accepted when new handshake has been completed.",
             env.message.getClass.getName, inboundContext.localAddress.uid, env.originUid)
           if (log.isDebugEnabled)
-            log.debug(s"Dropping message [{}] from unknown system with UID [{}]. " +
+            log.debug(
+              s"Dropping message [{}] from unknown system with UID [{}]. " +
               "This system with UID [{}] was probably restarted. " +
               "Messages will be accepted when new handshake has been completed.",
               env.message.getClass.getName, inboundContext.localAddress.uid, env.originUid)
